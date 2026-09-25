@@ -1288,6 +1288,205 @@ installed). This corrects claims elsewhere in this file that came from
   mapping, pan data, fallback pack, decider, failure safety, and every
   bundled file loading and being short.
 
+### Post-release bug: touch-explore silent over web content
+
+Reported as "touchscreen support is pretty bad for web-based apps:
+sometimes it literally says nothing; once something gets focus it works;
+wrong or too much text", on both touchscreen and trackpad, in browsers and
+Electron/WebView2 apps. **The log proved the silence**: in VS Code's webview
+(Chromium), two whole touch-explore drags (hoverdown, ~35 hovers, hoverup)
+and a string of explore taps produced **no speech at all**, while flicks
+over the same content spoke normally. Flicks go through
+`_navigateAndAnnounce`, not `_patchedMoveTo`.
+
+**Cause (from the code, confirmed by the log's pattern)**: `_patchedMoveTo`
+never speaks a touched object itself. It calls `_touchSelect()` and relies
+on NVDA's focus event to announce the result, which is correct for desktop
+icons. But `_touchSelect()` returns silently for anything not focusable,
+which is most web content (text, headings, groups, images). The only other
+speech path, text at the point, is often empty in focus-mode web apps, so
+nothing spoke. Stock `moveTo` always `speakObject`s a new object. The
+container-role silencing (checked *before* the browse-mode logic) also
+silenced whole web groups/lists/dialogs/`role=application`, text included.
+Separately, stock's browse-mode path reads the *whole touched object's*
+buffer text ("too much text").
+
+**Fix**:
+- `_touchSelect()` returns whether it started a focus change. The desktop
+  path `speakObject`s when it didn't (and no text is about to be spoken), and
+  `_navigateAndAnnounce` uses the same return value.
+- Web content (`Ia2Web`/`UIAWeb` in the class MRO, matched by name) gets
+  `_moveToWeb`, modelled on NVDA's `NVDAObject.event_mouseMove`: the
+  object's own point `makeTextInfo`, expanded to the unit (line), spoken once
+  per range as plain text. Placeholder U+FFFC and control characters (the
+  log showed raw `` being "spoken") are stripped, and blank text is
+  silent. `_WEB_TEXT_ROLES` (containers, document, section, paragraph,
+  static text, landmarks, table/toolbar...) only ever speak text. Anything
+  else is an element: `speakObject(FOCUS)` plus its role cue once on
+  arrival. **Real focus is never moved in web content.** The review
+  position is still set as stock does (browse-mode object text when there's
+  a tree interceptor), so double-tap activation is unchanged. Browse-mode
+  text can't be used for the point lookup: 2026.2's `virtualBuffers`
+  implements no `_getOffsetFromPoint`.
+- `_touchSelect()` now takes *selection* only for `_SELECT_ON_TOUCH_ROLES`
+  (list/tree items, table rows/cells/headers, the roles
+  `_processNegativeStates` reports "not selected" on) and only *focuses*
+  everything else. Before, it would `SelectionItemPattern.select()` or
+  `accSelect(TAKESELECTION)` a radio button (checking it) or a tab
+  (switching to it) merely because it was touched.
+- Tests (`test_web.py`, standalone) load the **real** plugin `__init__.py`
+  with NVDA stubbed around it: web text once per line, groups no longer
+  silent, placeholder/control text silent with the gap tick, elements
+  announced once without focus, the desktop non-focusable item now
+  spoken, and radio/tab/UIA radio never selected.
+- **Touch modes (release-2026.2, read not assumed)**: `TouchMode` is
+  TEXT/OBJECT/BROWSE. `availableTouchModes` (for 3-finger-tap cycling) is
+  TEXT and OBJECT only. `touchHandler._browseModeStateChange`
+  (`post_browseModeStateChange`) sets `handler._curTouchMode = BROWSE` while
+  browse mode is on and puts it back to OBJECT when it ends. It sets it on
+  whatever `touchHandler.handler` is, so it works on `TrackpadTouchScreen` too.
+  Explore gestures (`ts:hover`, `ts:tap`, `ts:hoverDown` ->
+  `screenExplorer.moveTo(x, y)`, default unit line) have **no mode prefix**, so
+  the patched `moveTo`/`_moveToWeb` runs identically in every mode. Only
+  flicks differ: `ts(object):` flicks are this add-on's overrides;
+  `ts(text):` are stock review-cursor text flicks; `ts(browse):` flicks
+  (in `browseMode.py`) are NVDA's own built-in **rotor-like element
+  navigation**. Up/down cycles the element type
+  (`virtualBuffers.browseModeTouchNavigationElements`); right/left runs
+  `script_next<Type>`, or `navigatorObject_next/previousInFlow` for the
+  default type. That's relevant to any future "rotor" feature: extend it,
+  don't duplicate it. Typed browse flicks start from the browse *caret*,
+  which touch-exploring deliberately doesn't move (stock doesn't either).
+- **`_mayMoveFocus` gates every `_touchSelect` call** (the desktop
+  `moveTo` path and `_navigateAndAnnounce`). No real focus move for web
+  content, for any document in browse mode (tree interceptor with
+  `passThrough` False; NVDA would move the browse caret to the focused
+  element and, with automatic focus mode for focus changes, switch to
+  focus mode on edit fields), or for touch keyboard keys (UIA
+  `cachedClassName == "CRootKey"`, the same test as NVDA's
+  `script_touch_hoverUp`), which would steal focus from the field being
+  typed into. That keeps the add-on's VoiceOver-style focus move limited to
+  ordinary desktop controls, where the user asked for it; everywhere else
+  touching behaves like NVDA's own review-cursor exploration.
+- **Verified live**: the user confirmed browsers work well with this path.
+  VS Code needed two more fixes (the next two sections). The
+  `log.debug("touchExplore: web hit role=... element=...")` line (one per
+  newly touched web object) stays, and shows which path each hit took.
+
+### Follow-up: VS Code still silent - stock moveTo's layout-hit drop
+
+The browser worked after the web path above, but VS Code stayed almost
+silent. **Log facts**: NVDA reads VS Code via **UIA** (`ChromiumUIA`, and
+plain `UIA` objects, per the "NVDA for VS Code" add-on's own
+`'...' object has no attribute 'IA2Attributes'` errors, 348 of them - that
+add-on's bug, not ours). All touches arrived as `ts(browse):hover` (browse
+mode was active). There were 346 hovers, **zero** `web hit` / `desktop hit`
+debug lines and zero exceptions from this add-on. The only silent return
+before those log lines is inherited verbatim from stock
+`ScreenExplorer.moveTo`: when the hit object isn't `presType_content`
+(e.g. an **unnamed group**, which is what web UIs are made of) and nothing
+transparent was skipped, `obj = prevObj` = None -> `return`. **Stock NVDA is
+equally silent there.**
+
+A read-only UIA probe of VS Code was attempted twice and captured nothing,
+because VS Code was on another virtual desktop (`DWMWA_CLOAKED` = 2,
+foreground = Program Manager). Check the cloak state *before* waiting on a
+"bring it to the front" probe.
+
+**Fix**:
+- `_patchedMoveTo` keeps the raw `hitObj`. At the drop point, web content
+  goes to `_moveToWeb(hitObj)` (layout groups are in `_WEB_TEXT_ROLES`, so
+  never announced themselves). Anything else is still dropped as stock does,
+  but now logs `touchExplore: dropped layout hit ...` once per distinct
+  object.
+- `_pointTextInfo` looks for text at the point on the object, then up to
+  `_MAX_TEXT_ANCESTORS` (12) ancestors, stopping at the DOCUMENT. UIA web
+  text lives in the document's TextPattern, not on the unnamed groups
+  actually hit. The answering object is cached per touched object, so
+  dragging within one object doesn't re-walk. There's no cache *across*
+  objects, which is a possible cost on slow UIA providers; watch for lag.
+- `_isWebContent` also accepts `windowClassName` in
+  `Chrome_RenderWidgetHostHWND`/`Chrome_WidgetWin_1`. NVDA only gives UIA
+  objects `UIAWeb` classes in the render widget, for framework "Chrome", or
+  with a TextPattern (`NVDAObjects/UIA/__init__.py`), so Electron UI outside
+  that was being treated as desktop.
+- Review position: set only from the touched object's *own* text. Checked
+  in `api.py`: `setNavigatorObject` already resets `reviewPosition` to None
+  so NVDA rebuilds it from the navigator. An earlier worry that a stale
+  review position could make double-tap activate the previous thing was
+  wrong for that reason, and code forcing a position was removed in favour
+  of NVDA's own behaviour.
+- `trackpadTouch.py` now uses `winBindings.user32.WNDPROC`/`WNDCLASSEXW`
+  (2026.2 deprecation warnings with stack traces on every start), falling
+  back to `winUser` on older NVDA.
+
+### Follow-up 2: VS Code point lookups land on an empty IA2 pane
+
+The layout-hit rescue above was not enough. The next log carried an
+in-process diagnostic (`_logSilentWebHit`, logged once per silent object).
+It showed that **213 hovers across the whole VS Code window resolved to ONE
+object**: an IA2 `Ia2Web` PANE in `Chrome_RenderWidgetHostHWND`, with
+`childCount=0` and no name. `isUIAWindow=False` (NVDA uses IA2 here), a
+fresh UIA `ElementFromPoint` raised COMError, and a fresh MSAA
+`AccessibleObjectFromPoint` returned the same empty pane (MSAA role 16).
+Flicking down into it said "No objects inside". Meanwhile, in the same
+seconds, keyboard focus reached real controls. The log confirmed VS Code
+was the foreground window at the time (Alt+Tab to it just before).
+
+A standalone probe (it works even while VS Code is cloaked on another
+desktop, because accHitTest is geometric) showed that VS Code has a single
+render widget, whose `OBJID_CLIENT` is a healthy DOCUMENT. Calling that
+document's `accHitTest` at points across the window returns the real
+**deepest** elements directly: the Files Explorer tree, the Claude chat
+document, the Message input edit, static text. So the tree is fine; the
+screen-point lookup is what lands on the empty pane. Why Chromium's
+`AccessibleObjectFromPoint` path returns that pane isn't known; the probe
+couldn't reproduce it with VS Code cloaked, and NVDA's own result was
+captured in-process.
+
+**Fix**: `_resolveWebDeadEnd`. A web hit that's in `_WEB_TEXT_ROLES`, in
+`Chrome_RenderWidgetHostHWND`, IA2-backed, with `childCount == 0` is a dead
+end (decided once per object and cached). While the finger is on it,
+`_hitTestFromDocument` re-asks that window's own document on **every**
+movement: `getNVDAObjectFromEvent(hwnd, OBJID_CLIENT=-4, 0)`, then an
+`accHitTest` loop (not `IAccessibleHandler.accHitTest`, which returns a
+nested tuple for IDispatch results in 2026.2). The result goes to
+`_moveToWeb`, falling back to the pane if anything fails. The diagnostic
+stays in place as a debug line.
+
+**Verified live: the user confirmed VS Code touch-exploring works.** The
+log of the working session showed:
+- The dead end was detected once. Re-hit-testing then produced 13 distinct
+  real web objects (STATICTEXT, SECTION, PARAGRAPH, TEXTFRAME, ARTICLE),
+  all `Ia2Web` in `Chrome_RenderWidgetHostHWND`, with no re-hit failures.
+- **In that same working session, a fresh MSAA `AccessibleObjectFromPoint`
+  still returned the empty role-16 pane.** So the screen-level point lookup
+  is consistently wrong for VS Code, not a transient state; the
+  document-level `accHitTest` is what works. Don't try to "fix" it by
+  retrying the screen-level lookup.
+- The remaining silent hits were containers *with* children
+  (`childCount` 1-8) where the finger was over padding with no text at the
+  point, the intended silence of `_moveToWeb`. They weren't dead ends, so
+  they correctly weren't re-hit-tested.
+
+**Learnings for similar reports** (another Electron/Chromium app, silent
+touch-explore):
+1. Check the `touchExplore: web hit` / `desktop hit` / `dropped layout hit` /
+   `silent web hit` / `dead-end web hit` counts first. Zero of all of them
+   with many `ts(...):hover` gestures means an early return before any of
+   them (historically, stock `moveTo`'s layout-hit drop).
+2. One `web hit` for a whole drag means every point resolved to the same
+   object, so the point lookup itself is the problem, not the speech
+   logic.
+3. `silent web hit` tells you which lookup is broken: `isUIAWindow`, and
+   what fresh UIA and MSAA point lookups return in-process at that moment.
+4. Standalone probes are still useful for the *document-level* view:
+   `AccessibleObjectFromWindow(hwnd, OBJID_CLIENT)` plus `accHitTest` is
+   geometric and works even while the app is cloaked on another virtual
+   desktop. Screen-level `WindowFromPoint`/`AccessibleObjectFromPoint` and
+   UIA `ElementFromPoint` probes don't: they hit whatever is visible there.
+   Check `DWMWA_CLOAKED` before waiting on a "bring it to the front" probe.
+
 ## Debugging workflow that actually worked
 
 Guessing at NVDA internals from memory/paraphrase burned an iteration early
@@ -1424,7 +1623,25 @@ at all, they'll appear as NVDA's own `core.py`/etc log lines.
   what made "the hardware sent zero WM_INPUT, full stop" a confirmed fact
   rather than a remaining assumption.
 
-Reach for this before iterating blindly on the next API guess - all seven
+- Eighth use, diagnosing "touch-explore silent in VS Code but fine in the
+  browser": three rounds, each adding the cheapest instrumentation that
+  could separate the remaining explanations, instead of shipping guesses.
+  Round 1: a per-hit debug line showed zero hits of any kind, which pointed
+  at an early return and identified stock `moveTo`'s layout-hit drop.
+  Round 2: after rescuing those, the per-hit line showed a whole drag
+  resolving to ONE object, so the point lookup was the problem. Round 3:
+  an in-process, once-per-object diagnostic asked both UIA and MSAA afresh
+  at the silent point, and both agreed on an empty pane. A standalone
+  document-level probe then showed the document's own `accHitTest` returns
+  real elements, and that became the fix. A plausible-sounding intermediate
+  theory ("a second, empty render widget on top") was checked and ruled out
+  in one probe (VS Code has one render widget) before any code was written
+  for it.
+  Also: a user who can't see the screen can't aim touches at specific
+  regions. Design live repro requests as "touch around", and make the
+  instrumentation, not the user's aim, pin down what was hit.
+
+Reach for this before iterating blindly on the next API guess - all eight
 times the actual cause was more specific (and the fix simpler) than the
 initial hypothesis.
 

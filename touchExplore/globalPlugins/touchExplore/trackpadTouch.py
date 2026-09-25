@@ -107,6 +107,15 @@ from logHandler import log
 
 from . import monitors, touchSettings
 
+# NVDA 2026.2 moved these to winBindings.user32 and logs a deprecation
+# warning (with stack trace) for every use of the old winUser names; fall
+# back to those only on older NVDA versions that lack winBindings.
+try:
+	from winBindings.user32 import WNDCLASSEXW, WNDPROC
+except ImportError:
+	WNDCLASSEXW = winUser.WNDCLASSEXW
+	WNDPROC = winUser.WNDPROC
+
 user32 = windll.user32
 kernel32 = windll.kernel32
 hidDll = windll.hid
@@ -354,7 +363,7 @@ user32.RegisterRawInputDevices.argtypes = [POINTER(RAWINPUTDEVICE), UINT, UINT]
 user32.RegisterRawInputDevices.restype = BOOL
 user32.GetRawInputData.argtypes = [HANDLE, UINT, c_void_p, POINTER(UINT), UINT]
 user32.GetRawInputData.restype = c_uint32
-user32.RegisterClassExW.argtypes = [POINTER(winUser.WNDCLASSEXW)]
+user32.RegisterClassExW.argtypes = [POINTER(WNDCLASSEXW)]
 user32.RegisterClassExW.restype = USHORT  # ATOM
 user32.CreateWindowExW.argtypes = [
 	DWORD,
@@ -1055,9 +1064,9 @@ class TrackpadTouchScreen:
 		classAtom = None
 		try:
 			hInstance = kernel32.GetModuleHandleW(None)
-			self._wndProcRef = winUser.WNDPROC(self._wndProc)
-			wndClass = winUser.WNDCLASSEXW(
-				cbSize=sizeof(winUser.WNDCLASSEXW),
+			self._wndProcRef = WNDPROC(self._wndProc)
+			wndClass = WNDCLASSEXW(
+				cbSize=sizeof(WNDCLASSEXW),
 				lpfnWndProc=self._wndProcRef,
 				hInstance=hInstance,
 				lpszClassName="touchExploreTrackpadTouchWindowClass",

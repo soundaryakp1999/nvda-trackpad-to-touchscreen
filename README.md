@@ -55,6 +55,58 @@ Improves NVDA's touch explore-by-touch feedback:
   a calibration that measures your own taps and flicks. See "Touch settings
   and calibration" below.
 
+## Web pages and web-based apps
+
+In web content (Edge, Chrome and Firefox pages, and apps built on web
+technology, such as Teams, WhatsApp, Slack or VS Code), touch-exploring
+works like NVDA's own mouse tracking:
+
+- Over text (paragraphs, plain text, sections, groups), NVDA reads the
+  line under your finger, once per line, rather than a whole block.
+- Over an element (link, button, heading, edit field, check box, image, list
+  item, table cell), NVDA announces the element once when your finger
+  reaches it, with its own sound.
+- Empty space between elements is silent, apart from the faint empty-space
+  tick.
+- Apps built on Chromium, such as VS Code, sometimes answer "what's under
+  the finger" with one empty area covering the whole window, which would
+  make touch-exploring silent (it is in NVDA without this add-on). When
+  that happens, the add-on asks the app's own document what's at that point
+  instead, so the item under your finger is still read.
+- Touching doesn't move the page's focus, since web apps react to focus, for
+  example by opening menus or switching NVDA to focus mode. Double-tap to
+  activate what's under your finger, or to go into an edit field.
+
+### Touch modes
+
+NVDA has three touch modes. Three-finger tap cycles between text and object
+mode. Browse mode switches on by itself whenever NVDA's browse mode is
+active, for example on a web page, and back to object mode when it ends.
+
+- **Touch-exploring** (dragging or tapping a finger) is the same in every
+  mode and uses the behaviour described above.
+- **Object mode flicks** move between objects. This add-on adds its sounds,
+  and moves focus to the object only for ordinary desktop controls (see
+  below).
+- **Text mode and browse mode flicks** are NVDA's own and unchanged. In
+  browse mode, flick up or down chooses an element type (headings, links,
+  and so on), and flick right or left moves to the next or previous one of
+  that type. Choosing the default type moves object by object.
+
+Touching only moves real focus on ordinary desktop controls. It never does
+so in web content, in any document that's in browse mode (web pages, Word,
+Outlook messages, PDFs), or on an on-screen touch keyboard. This follows
+NVDA's rules for those modes: exploring moves NVDA's review position, not
+the focus. Otherwise, touching an edit field in browse mode would switch
+NVDA to focus mode, and touching a touch keyboard key would take focus away
+from the field you're typing into. In browse mode, "next heading" and the
+other element types start from the browse mode cursor, not from the point
+you touched, just as in NVDA without this add-on.
+
+Elsewhere, touching a radio button or tab moves focus to it but never
+selects it, so it can't check a radio button or switch tabs by accident.
+Selecting on touch only applies to list, tree and table items.
+
 ## Sounds
 
 Sounds are set in NVDA Settings > **Touch Explore** > Sounds:

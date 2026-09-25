@@ -38,12 +38,13 @@ import locationHelper
 import screenExplorer
 import speech
 import textInfos
+import textUtils
 import touchHandler
 import ui
 import wx
 from comtypes import COMError
 from logHandler import log
-from NVDAObjects import NVDAObject
+from NVDAObjects import NVDAObject, NVDAObjectTextInfo
 from scriptHandler import script
 from utils.security import objectBelowLockScreenAndWindowsIsLocked
 
@@ -96,7 +97,7 @@ _CONTAINER_ROLES = frozenset(
 _SELFLAG_TAKEFOCUS_AND_SELECTION = 1 | 2
 
 
-def _touchSelect(obj) -> None:
+def _touchSelect(obj) -> bool:
 	"""Move real focus and selection to obj, mirroring VoiceOver: touch-explore
 	doesn't just narrate items, it makes the touched item the
 	actually-focused/selected one (and, for single-select controls,
@@ -116,26 +117,89 @@ def _touchSelect(obj) -> None:
 	moves focus - so there selection needs the SelectionItemPattern's
 	select() explicitly, which NVDA's own doAction() uses the same way and
 	which also moves focus as part of selecting.
+
+	Returns True if it started a real focus change - which NVDA's focus
+	event will then announce - or False if it did nothing (not focusable,
+	already focused, or every attempt failed), in which case nothing will
+	announce obj unless the caller does. (Silently returning without
+	announcing was the cause of touch-explore saying nothing at all over
+	non-focusable content, e.g. most of a web app - see CLAUDE.md.)
+
+	Selection, as opposed to focus, is only taken for the roles
+	_processNegativeStates reports "not selected" on (list/tree items, table
+	rows/cells/headers) - the whole reason for selecting at all. Anything
+	else only gets focus: "selecting" a radio button checks it and
+	"selecting" a tab switches to it, which touching must never do.
 	"""
 	states = obj.states
 	if controlTypes.State.FOCUSABLE not in states or controlTypes.State.FOCUSED in states:
-		return
-	selectionItemPattern = getattr(obj, "UIASelectionItemPattern", None)
-	if selectionItemPattern is not None:
-		try:
-			selectionItemPattern.select()
-		except COMError:
-			log.debugWarning("touchExplore: UIASelectionItemPattern.select() failed", exc_info=True)
-		return
-	iaObj = getattr(obj, "IAccessibleObject", None)
-	iaChildId = getattr(obj, "IAccessibleChildID", None)
-	if iaObj is not None:
-		try:
-			iaObj.accSelect(_SELFLAG_TAKEFOCUS_AND_SELECTION, iaChildId)
-			return
-		except COMError:
-			log.debugWarning("touchExplore: accSelect(TAKEFOCUS|TAKESELECTION) failed", exc_info=True)
-	obj.setFocus()
+		return False
+	if obj.role in _SELECT_ON_TOUCH_ROLES:
+		selectionItemPattern = getattr(obj, "UIASelectionItemPattern", None)
+		if selectionItemPattern is not None:
+			try:
+				selectionItemPattern.select()
+				return True
+			except COMError:
+				log.debugWarning("touchExplore: UIASelectionItemPattern.select() failed", exc_info=True)
+		iaObj = getattr(obj, "IAccessibleObject", None)
+		iaChildId = getattr(obj, "IAccessibleChildID", None)
+		if iaObj is not None:
+			try:
+				iaObj.accSelect(_SELFLAG_TAKEFOCUS_AND_SELECTION, iaChildId)
+				return True
+			except COMError:
+				log.debugWarning("touchExplore: accSelect(TAKEFOCUS|TAKESELECTION) failed", exc_info=True)
+	try:
+		obj.setFocus()
+		return True
+	except Exception:
+		log.debugWarning("touchExplore: setFocus() failed", exc_info=True)
+		return False
+
+
+def _mayMoveFocus(obj) -> bool:
+	"""Whether touching obj may move REAL focus to it (_touchSelect), as
+	opposed to only moving NVDA's navigator/review position, as stock NVDA's
+	touch exploring always does. Real focus is this add-on's VoiceOver-style
+	addition for ordinary desktop controls, and must stay out of the places
+	where NVDA's own mode rules depend on focus not moving behind the user's
+	back:
+	- Web content, in browse or focus mode: web apps react to focus (menus
+	  open, content changes), and focus there is the user's typing target.
+	- Any document in browse mode (tree interceptor not in pass-through), web
+	  or not (Word, Outlook, PDF): there NVDA owns navigation, and a focus
+	  change moves the browse-mode caret to the touched element - and, with
+	  NVDA's default "automatic focus mode for focus changes", switches to
+	  focus mode on an edit field - just from exploring.
+	- An on-screen touch keyboard key (UIA class CRootKey - the same test
+	  NVDA's own touch-typing hoverUp script uses): focusing it would take
+	  focus away from the field being typed into.
+	"""
+	if _isWebContent(obj):
+		return False
+	treeInterceptor = getattr(obj, "treeInterceptor", None)
+	if treeInterceptor is not None and not getattr(treeInterceptor, "passThrough", True):
+		return False
+	try:
+		if obj.UIAElement.cachedClassName == "CRootKey":
+			return False
+	except Exception:
+		pass  # not UIA, or the element is gone
+	return True
+
+
+# See _touchSelect: the roles where touch also takes SELECTION, not just focus.
+_SELECT_ON_TOUCH_ROLES = frozenset(
+	{
+		controlTypes.Role.LISTITEM,
+		controlTypes.Role.TREEVIEWITEM,
+		controlTypes.Role.TABLEROW,
+		controlTypes.Role.TABLECELL,
+		controlTypes.Role.TABLECOLUMNHEADER,
+		controlTypes.Role.TABLEROWHEADER,
+	},
+)
 
 
 def _activateObject(obj, gesture) -> None:
@@ -223,12 +287,12 @@ def _navigateAndAnnounce(newObj) -> None:
 		)
 		speech.speakObject(newObj, reason=controlTypes.OutputReason.FOCUS)
 		return
-	statesBefore = newObj.states
-	_touchSelect(newObj)
-	if controlTypes.State.FOCUSABLE not in statesBefore or controlTypes.State.FOCUSED in statesBefore:
-		# _touchSelect() was a no-op (not focusable, or already focused) -
-		# nothing will announce newObj on its own, so do it ourselves,
-		# matching the stock scripts' own fallback behavior.
+	if not _mayMoveFocus(newObj) or not _touchSelect(newObj):
+		# No real focus change (not allowed here - web content, browse mode,
+		# touch keyboard: see _mayMoveFocus - or not focusable, already
+		# focused, or the attempt failed) - nothing will announce newObj on
+		# its own, so do it ourselves, matching the stock scripts' own
+		# behavior.
 		speech.speakObject(newObj, reason=controlTypes.OutputReason.FOCUS)
 
 
@@ -301,8 +365,355 @@ def _isContainerHit(obj) -> bool:
 	return obj.role in _CONTAINER_ROLES
 
 
+# --- Web content (browsers, Electron/WebView2 apps) ----------------------
+# Diagnosed from a real log (VS Code's webview UI, Chromium): two whole
+# touch-explore drags and several explore taps produced no speech at all,
+# while flicks over the same content spoke fine. The desktop path relies on
+# moving real focus to the touched item and letting NVDA's focus event
+# announce it, but most web content (text, headings, groups, images) isn't
+# focusable, so nothing spoke - and where it did speak, the browse-mode path
+# read a whole element's text ("too much text"), not what was under the
+# finger. Web content therefore gets its own path, modelled on NVDA's own
+# mouse tracking (NVDAObject.event_mouseMove), which handles web content
+# well: the text under the finger, a line at a time, for text-like content;
+# the element itself (name, role, states) for real elements; real focus never
+# moved (web apps react to focus - menus open, NVDA switches to focus mode -
+# and VoiceOver doesn't move it either; double-tap activation still works via
+# the review position, set exactly as stock moveTo sets it).
+
+# Every Chromium/Firefox content object is an Ia2Web; Edge's UIA web
+# content is UIAWeb. Matched by class name so nothing web-specific has to be
+# imported (and a missing module on some NVDA version can't break loading).
+_WEB_CLASS_NAMES = frozenset({"Ia2Web", "UIAWeb"})
+
+
+# Chromium/Electron windows: everything in them is web-rendered UI (VS Code,
+# Teams, Slack...), but NVDA only gives UIA objects its UIAWeb classes inside
+# the render widget, for the "Chrome" UIA framework, or with a TextPattern
+# (NVDAObjects/UIA/__init__.py findOverlayClasses) - VS Code's log showed
+# plain 'UIA' objects there too.
+_WEB_WINDOW_CLASSES = frozenset({"Chrome_RenderWidgetHostHWND", "Chrome_WidgetWin_1"})
+
+
+def _isWebContent(obj) -> bool:
+	if any(cls.__name__ in _WEB_CLASS_NAMES for cls in type(obj).__mro__):
+		return True
+	return getattr(obj, "windowClassName", None) in _WEB_WINDOW_CLASSES
+
+
+def _roles(*names):
+	# By name, skipping any role the running NVDA doesn't have.
+	return frozenset(getattr(controlTypes.Role, name) for name in names if hasattr(controlTypes.Role, name))
+
+
+# Web roles that are text or structure rather than an element to announce:
+# for these only the text under the finger is spoken (and nothing, not
+# "section"/"document"/"group", when there's no text there).
+_WEB_TEXT_ROLES = _CONTAINER_ROLES | _roles(
+	"DOCUMENT",
+	"SECTION",
+	"PARAGRAPH",
+	"STATICTEXT",
+	"TEXTFRAME",
+	"LABEL",
+	"BLOCKQUOTE",
+	"ARTICLE",
+	"REGION",
+	"LANDMARK",
+	"FORM",
+	"FIGURE",
+	"HEADER",
+	"FOOTER",
+	"CAPTION",
+	"TABLE",
+	"TABLEBODY",
+	"TOOLBAR",
+	"MENUBAR",
+	"TABCONTROL",
+	"UNKNOWN",
+)
+
+
+# Text roles whose own name/value IS their text (see the fallback in
+# _moveToWeb).
+_WEB_LEAF_TEXT_ROLES = _roles("STATICTEXT", "PARAGRAPH", "LABEL", "TEXTFRAME", "CAPTION", "BLOCKQUOTE")
+
+
+def _cleanText(text) -> str:
+	"""text without embedded-object placeholders (U+FFFC, which web text
+	uses for each child element) or other unprintable characters (the log
+	showed raw '\\x04' control characters being "spoken", as silence), with
+	whitespace collapsed; "" if nothing readable is left.
+	"""
+	text = text.replace(textUtils.OBJ_REPLACEMENT_CHAR, " ")
+	return " ".join("".join(ch if ch.isprintable() else " " for ch in text).split())
+
+
+# How far up from the touched object to look for text at the point: web text
+# via UIA (Chromium in VS Code) lives in the document's TextPattern, several
+# unnamed groups above the object actually hit.
+_MAX_TEXT_ANCESTORS = 12
+
+
+def _pointTextInfo(explorer, obj, hasNewObj, x, y, unit):
+	"""The text at (x, y), a unit's worth, from obj or - if obj can't look
+	text up by point - its nearest ancestor that can, up to the document.
+	Which object answered is remembered per touched object, so dragging
+	within one object doesn't re-walk its ancestors on every movement.
+	"""
+	point = locationHelper.Point(x, y)
+	cached = getattr(explorer, "_touchExploreTextSource", None)
+	if not hasNewObj and cached and cached[0] == obj:
+		candidates = [cached[1]] if cached[1] is not None else []
+	else:
+		candidates = []
+		cur = obj
+		for _ in range(_MAX_TEXT_ANCESTORS):
+			if cur is None:
+				break
+			candidates.append(cur)
+			if cur.role == controlTypes.Role.DOCUMENT:
+				break
+			try:
+				cur = cur.parent
+			except Exception:
+				break
+	for source in candidates:
+		try:
+			info = source.makeTextInfo(point)
+			info.expand(unit)
+		except (NotImplementedError, LookupError, COMError, RuntimeError):
+			continue
+		explorer._touchExploreTextSource = (obj, source)
+		return info
+	explorer._touchExploreTextSource = (obj, None)
+	return None
+
+
+def _logSilentWebHit(explorer, obj, x, y):
+	"""Debug-only, once per touched object: everything needed to tell WHY a
+	web hit had no text, captured in-process at the moment it happened (the
+	approach CLAUDE.md recommends after standalone after-the-fact probes
+	misled an earlier investigation). A VS Code log showed a whole drag
+	resolving to one unnamed PANE; whether that's UI Automation's own
+	answer or NVDA taking the IA2 route decides the fix, so both APIs are
+	asked afresh here. Every probe is guarded - this must never break a
+	gesture.
+	"""
+	if getattr(explorer, "_touchExploreDiagnosed", None) == obj:
+		return
+	explorer._touchExploreDiagnosed = obj
+	parts = [
+		f"role={obj.role!r}",
+		f"classes={[c.__name__ for c in type(obj).__mro__[:5]]}",
+		f"window={getattr(obj, 'windowClassName', None)!r}",
+	]
+	try:
+		parts.append(f"childCount={obj.childCount}")
+	except Exception as e:
+		parts.append(f"childCount=<{e!r}>")
+	try:
+		import UIAHandler
+		from ctypes.wintypes import POINT
+
+		handler = UIAHandler.handler
+		if handler:
+			parts.append(f"isUIAWindow={handler.isUIAWindow(obj.windowHandle)}")
+			raw = handler.clientObject.ElementFromPoint(POINT(x, y))
+			parts.append(
+				f"uiaElementFromPoint=[{handler.getUIAElementDebugString(raw)}] "
+				f"native={handler.isNativeUIAElement(raw)}",
+			)
+	except Exception as e:
+		parts.append(f"uia=<{e!r}>")
+	try:
+		import IAccessibleHandler
+
+		res = IAccessibleHandler.accessibleObjectFromPoint(x, y)
+		if res:
+			pacc, child = res
+			parts.append(f"msaaFromPoint=[role={pacc.accRole(child)} name={pacc.accName(child)!r:.40}]")
+		else:
+			parts.append("msaaFromPoint=None")
+	except Exception as e:
+		parts.append(f"msaa=<{e!r}>")
+	log.debug("touchExplore: silent web hit " + " ".join(parts))
+
+
+# MSAA OBJID_CLIENT (winUser's constants are being deprecated in favour of
+# winBindings; the value itself is fixed by Windows).
+_OBJID_CLIENT = -4
+_MAX_HIT_TEST_DEPTH = 40
+
+
+def _childCount(obj):
+	try:
+		return obj.childCount
+	except Exception:
+		return None
+
+
+def _resolveWebDeadEnd(explorer, obj, x, y):
+	"""obj, or - if obj is a dead end - what Chromium's own document says is
+	at (x, y).
+
+	Diagnosed from a user's log with in-process instrumentation
+	(_logSilentWebHit): touch-exploring VS Code, 213 hovers across the whole
+	window all resolved to ONE IA2 web PANE in Chrome_RenderWidgetHostHWND
+	with childCount 0 and no text ("No objects inside" when flicked into),
+	while keyboard focus reached real controls in the same seconds - and a
+	fresh MSAA AccessibleObjectFromPoint at the same point returned the same
+	empty pane (UIA ElementFromPoint failed outright; isUIAWindow=False).
+	A standalone probe then showed that asking the render widget's own
+	document (AccessibleObjectFromWindow(hwnd, OBJID_CLIENT)) accHitTest at
+	points across the window returns the real, deepest elements - the Files
+	Explorer tree, the chat document, the message edit, text. So when the
+	point lookup lands on such a dead end, re-ask the document of the same
+	window. Dead-endedness is decided once per object; the re-hit-test runs
+	on every movement while the finger stays on it (the pane doesn't change,
+	what's under the finger does).
+	"""
+	cached = getattr(explorer, "_touchExploreDeadEnd", None)
+	if cached and cached[0] == obj:
+		dead = cached[1]
+	else:
+		dead = (
+			obj.role in _WEB_TEXT_ROLES
+			and getattr(obj, "windowClassName", None) == "Chrome_RenderWidgetHostHWND"
+			and getattr(obj, "IAccessibleObject", None) is not None
+			and _childCount(obj) == 0
+		)
+		explorer._touchExploreDeadEnd = (obj, dead)
+		if dead:
+			log.debug(f"touchExplore: dead-end web hit role={obj.role!r}; re-hit-testing from the document")
+	if not dead:
+		return obj
+	better = _hitTestFromDocument(obj.windowHandle, x, y)
+	return better if better is not None else obj
+
+
+def _hitTestFromDocument(windowHandle, x, y):
+	"""The deepest IAccessible at (x, y) as reported by accHitTest on
+	windowHandle's own client object (the web document), or None. Chromium
+	returns the deepest node directly; the loop follows any intermediate
+	IDispatch results anyway, bounded. (Not IAccessibleHandler.accHitTest:
+	in NVDA 2026.2 it returns a nested tuple for IDispatch results.)
+	"""
+	try:
+		import IAccessibleHandler
+		from NVDAObjects.IAccessible import IAccessible, getNVDAObjectFromEvent
+
+		root = getNVDAObjectFromEvent(windowHandle, _OBJID_CLIENT, 0)
+		if root is None:
+			return None
+		pacc = root.IAccessibleObject
+		childID = 0
+		for _ in range(_MAX_HIT_TEST_DEPTH):
+			res = pacc.accHitTest(x, y)
+			if res is None:
+				break
+			if isinstance(res, int):
+				childID = res
+				break
+			pacc = IAccessibleHandler.normalizeIAccessible(res)
+		return IAccessible(IAccessibleObject=pacc, IAccessibleChildID=childID)
+	except Exception:
+		log.debugWarning("touchExplore: re-hit-test from document failed", exc_info=True)
+		return None
+
+
+def _sameRange(a, b) -> bool:
+	if a is None or b is None or a.__class__ is not b.__class__ or a.obj != b.obj:
+		return False
+	try:
+		return a.compareEndPoints(b, "startToStart") == 0 and a.compareEndPoints(b, "endToEnd") == 0
+	except Exception:
+		return False
+
+
+def _moveToWeb(self, obj, x, y, new, unit):
+	global _lastHitWasItem
+	hasNewObj = obj != self._obj
+	if hasNewObj:
+		self._obj = obj
+		if self.updateReview and not api.setNavigatorObject(obj):
+			return
+	if objectBelowLockScreenAndWindowsIsLocked(obj):
+		return
+	# Review position exactly as stock moveTo sets it (the browse-mode text
+	# of the touched object when there's a tree interceptor), so double-tap
+	# activation and review commands behave as they would without this
+	# add-on.
+	reviewPos = None
+	if obj.treeInterceptor:
+		try:
+			reviewPos = obj.treeInterceptor.makeTextInfo(obj)
+		except LookupError:
+			reviewPos = None
+	isElement = obj.role not in _WEB_TEXT_ROLES
+	# What's spoken for text-like content: the text at the finger, a line's
+	# worth - what mouse tracking reads - from obj or the nearest ancestor that
+	# can look text up by point. (Browse mode's buffer has no point lookup in
+	# NVDA 2026.2: virtualBuffers implements no _getOffsetFromPoint.) Not
+	# needed for elements, which are announced as objects.
+	pointPos = None
+	if not isElement:
+		pointPos = _pointTextInfo(self, obj, hasNewObj, x, y, unit)
+		if pointPos is None and obj.role in _WEB_LEAF_TEXT_ROLES:
+			# No point lookup anywhere (e.g. UIA web text without a TextPattern):
+			# the object's own name/value text, exactly as mouse tracking falls
+			# back to NVDAObjectTextInfo. Only for leaf text - a container's name
+			# ("Explorer section") under the finger is the chatter the container
+			# rule exists to prevent.
+			pointPos = NVDAObjectTextInfo(obj, textInfos.POSITION_ALL)
+	# Review position: only ever from the touched object's own text (the
+	# browse-mode text of it, as stock moveTo sets it, or its own point text).
+	# Text found on an ancestor (the document) isn't obj's, and double-tap
+	# activates the review position first - so in that case leave it alone:
+	# api.setNavigatorObject(obj) above already reset it to None, so NVDA
+	# rebuilds it from the navigator object (obj) when next asked.
+	if reviewPos is None and pointPos is not None and pointPos.obj == obj:
+		reviewPos = pointPos
+	if self.updateReview and reviewPos is not None:
+		api.setReviewPosition(reviewPos)
+	if hasNewObj:
+		log.debug(
+			f"touchExplore: web hit role={obj.role!r} element={isElement} "
+			f"classes={[c.__name__ for c in type(obj).__mro__[:3]]} "
+			f"window={getattr(obj, 'windowClassName', None)!r} name={obj.name!r:.60}",
+		)
+	if isElement:
+		# Announced once, on arrival - not again as the finger moves within it.
+		if hasNewObj or new:
+			speech.cancelSpeech()
+			audioCues.playForObject(obj, x, y)
+			speech.speakObject(obj, reason=controlTypes.OutputReason.FOCUS)
+			self._pos = pointPos
+		_lastHitWasItem = True
+		return
+	text = _cleanText(pointPos.text) if pointPos else ""
+	if text:
+		if new or not _sameRange(pointPos, self._pos):
+			self._pos = pointPos
+			speech.cancelSpeech()
+			audioCues.play(audioCues.ITEM, x, y)
+			speech.speakText(text)
+		_lastHitWasItem = True
+	else:
+		# Nothing readable under the finger (padding, margins, the gap
+		# between elements): silent, with the same one-off gap tick as the
+		# desktop path when arriving from an item.
+		_logSilentWebHit(self, obj, x, y)
+		if hasNewObj and _lastHitWasItem and config.conf["touchExplore"]["gapSound"]:
+			audioCues.play(audioCues.GAP, x, y)
+		_lastHitWasItem = False
+
+
+# --- end web content -------------------------------------------------------
+
+
 def _patchedMoveTo(self, x, y, new=False, unit=textInfos.UNIT_LINE):
-	obj = api.getDesktopObject().objectFromPoint(x, y)
+	hitObj = obj = api.getDesktopObject().objectFromPoint(x, y)
 	prevObj = None
 	while obj and obj.beTransparentToMouse:
 		prevObj = obj
@@ -311,10 +722,39 @@ def _patchedMoveTo(self, x, y, new=False, unit=textInfos.UNIT_LINE):
 		obj.presentationType != obj.presType_content and obj.role != controlTypes.Role.PARAGRAPH
 	):
 		obj = prevObj
+	# Web content: see _moveToWeb. Includes the case where stock moveTo gives
+	# up (obj is None below): the hit object is layout-only (e.g. an unnamed
+	# group) and nothing transparent was skipped - confirmed from a user's
+	# log as one reason touch-exploring VS Code was completely silent. Web
+	# UIs are mostly unnamed groups, with the text belonging to the document
+	# around them, so carry on with the hit object instead of dropping it.
+	webObj = None
+	if obj is not None and _isWebContent(obj):
+		webObj = obj
+	elif obj is None and hitObj is not None and _isWebContent(hitObj):
+		webObj = hitObj
+	if webObj is not None:
+		_moveToWeb(self, _resolveWebDeadEnd(self, webObj, x, y), x, y, new, unit)
+		return
 	if not obj:
+		if hitObj is not None and hitObj != getattr(self, "_touchExploreLastDropped", None):
+			self._touchExploreLastDropped = hitObj
+			log.debug(
+				f"touchExplore: dropped layout hit role={hitObj.role!r} "
+				f"classes={[c.__name__ for c in type(hitObj).__mro__[:4]]} "
+				f"window={getattr(hitObj, 'windowClassName', None)!r} name={hitObj.name!r:.60}",
+			)
 		return
 
 	containerHit = _isContainerHit(obj)
+	if obj != self._obj:
+		# One line per newly touched object, like _moveToWeb's - what the
+		# desktop path decided, for diagnosing silence from a user's log.
+		log.debug(
+			f"touchExplore: desktop hit role={obj.role!r} container={containerHit} "
+			f"classes={[c.__name__ for c in type(obj).__mro__[:4]]} "
+			f"window={getattr(obj, 'windowClassName', None)!r} name={obj.name!r:.60}",
+		)
 
 	hasNewObj = False
 	if obj != self._obj:
@@ -407,8 +847,12 @@ def _patchedMoveTo(self, x, y, new=False, unit=textInfos.UNIT_LINE):
 		# ("Recycle Bin" not "Recycle Bin, list item") and selection-state
 		# speech ("selected"/"not selected") correctly, since the touched item
 		# genuinely is now the selected one. Speaking it ourselves here too
-		# would double-announce every item.
-		_touchSelect(obj)
+		# would double-announce every item - but when no focus change
+		# happens (not focusable, already focused, failed), nothing else
+		# will announce it, so speak it here, as stock moveTo does (unless
+		# the text under the finger is about to be spoken anyway).
+		if not (_mayMoveFocus(obj) and _touchSelect(obj)) and not posChanged:
+			speech.speakObject(obj, reason=controlTypes.OutputReason.FOCUS)
 	if posChanged:
 		self._pos = pos
 		if not speechCanceled:
